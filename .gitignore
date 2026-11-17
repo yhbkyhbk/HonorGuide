@@ -1,0 +1,29 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Generated documents, indexes, databases, and request logs
+/data/storage/
+/data/evaluation/results.json
+
+# Machine-specific desktop shortcut
+/frontend/*.lnk
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp

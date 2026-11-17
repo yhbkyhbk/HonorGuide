@@ -1,0 +1,221 @@
+{
+  "benchmark": "HonorGuide 10-question baseline",
+  "benchmark_date": "2026-11-13",
+  "protocol": {
+    "scope": "仅依据当前本地攻略和 Neo4j 图谱；衡量本项目内表现，不代表当前游戏版本或通用能力。",
+    "run_settings": {
+      "mode": "auto",
+      "top_k": 3,
+      "recall_k": 10
+    },
+    "retrieval": "先标注后运行。文本 Hit@3 按 expected_text_groups 的可替代证据组判定；文本 Recall@3 按命中的组数计算；图关系按有向三元组去重。无答案题不计入有答案检索指标。",
+    "citations": "项目扩展：先固定分句/列表行与实际引用，再通过 RAGAS llm_factory 的结构化接口逐单元审计。Citation Recall=带引用且被实际引用证据联合充分支持的需引用单元数/全部需引用单元数；Citation Precision=对充分支持的单元提供full或partial支持的引用出现次数/全部实际引用出现次数。不是RAGAS内置指标。",
+    "relevancy": "使用 RAGAS 内置 AnswerRelevancy(strictness=3)，由框架反推问题、调用配置中的嵌入模型并计算分数；另外通过RAGAS结构化引用审计记录0/1/2分的对题性和子问题覆盖。",
+    "limitations": "生成与评审使用同一个 LLM，存在共同偏差。相似度不是正确率。所有答案、证据和逐项评审都会保留；这是一次小样本基线，不按结果调整题目或修复生产提示词后重算。",
+    "citation_unit": "逐行后按中文句末标点固定分句；句末紧跟的引用归于前句。程序保留每个引用编号和出现次数，模型只能评审固定单元。",
+    "review": "检查固定单元是否全部返回、各单元引用编号和次数是否准确；失败则重试一次，不合格不计分。框架异常、非有限分数保留错误与断点，不能补成0分。",
+    "relevancy_note": "RAGAS可能将正确拒答判为noncommittal而给低相关性分；结合单独的appropriate_abstention_rate阅读，不把相关性分当作事实正确率。",
+    "ragas": {
+      "version": "0.4.4",
+      "api": "ragas.metrics.collections",
+      "metrics": [
+        "faithfulness",
+        "answer_relevancy",
+        "context_precision",
+        "context_recall"
+      ],
+      "reference": "逐题编写 reference，供 ContextPrecision / ContextRecall 使用；不传入检索或回答生成。",
+      "contexts": "实际文本证据与图谱证据转成字符串，按提供给回答模型的证据顺序评测；Context Precision 不等于 Precision@3。",
+      "aggregation": "RAGAS 指标按题取算术平均，并记录有效题数；无答案题或无检索证据时 Faithfulness / ContextPrecision / ContextRecall 标为不适用，不补造0或1。AnswerRelevancy 仍按框架原逻辑运行，同时单列有答案题均值。"
+    }
+  },
+  "cases": [
+    {
+      "id": "Q01",
+      "question": "虞姬二技能能免疫法术伤害和真实伤害吗？",
+      "expected_mode": "hybrid",
+      "answerable": true,
+      "expected_text_groups": [
+        [
+          "yuji_guide_003",
+          "yuji_guide_000"
+        ]
+      ],
+      "expected_graph": [],
+      "key_points": [
+        "不能免疫法术伤害",
+        "不能免疫真实伤害",
+        "不能把二技能描述为无敌"
+      ],
+      "reference": "虞姬二技能可以免疫物理伤害，不能免疫法术伤害或真实伤害，因此不等于无敌。"
+    },
+    {
+      "id": "Q02",
+      "question": "艾琳一技能叫什么名字，能造成什么控制效果？",
+      "expected_mode": "hybrid",
+      "answerable": true,
+      "expected_text_groups": [
+        [
+          "ailing_guide_002"
+        ]
+      ],
+      "expected_graph": [],
+      "key_points": [
+        "名称为叶舞·致意",
+        "控制效果是减速，不应编造眩晕或击飞"
+      ],
+      "reference": "艾琳一技能名为“叶舞·致意”，可以造成减速；不能把它描述成眩晕或击飞。"
+    },
+    {
+      "id": "Q03",
+      "question": "艾琳二技能的免疫减速，是否等于免疫所有控制？",
+      "expected_mode": "hybrid",
+      "answerable": true,
+      "expected_text_groups": [
+        [
+          "ailing_guide_003"
+        ]
+      ],
+      "expected_graph": [],
+      "key_points": [
+        "不等于免疫所有控制",
+        "也不等于免疫伤害"
+      ],
+      "reference": "艾琳二技能的免疫减速不等于免疫所有控制，也不等于免疫伤害。"
+    },
+    {
+      "id": "Q04",
+      "question": "谁克制虞姬，虞姬能否用三技能向任意方向位移？",
+      "expected_mode": "combined",
+      "answerable": true,
+      "expected_text_groups": [
+        [
+          "yuji_guide_004"
+        ]
+      ],
+      "expected_graph": [
+        [
+          "艾琳",
+          "COUNTERS",
+          "虞姬"
+        ]
+      ],
+      "key_points": [
+        "艾琳对虞姬存在有条件的机制优势",
+        "三技能需要指定目标",
+        "三技能不能像自由位移一样任意选择方向",
+        "应分别回应克制关系与位移问题"
+      ],
+      "reference": "当前图谱收录艾琳对虞姬有条件的机制克制。虞姬三技能需要指定目标，不能像自由位移一样任意选择方向。"
+    },
+    {
+      "id": "Q05",
+      "question": "虞姬面对法术威胁明显的阵容，可以考虑哪些生存装备？",
+      "expected_mode": "hybrid",
+      "answerable": true,
+      "expected_text_groups": [
+        [
+          "yuji_guide_007"
+        ]
+      ],
+      "expected_graph": [],
+      "key_points": [
+        "资料提供魔女斗篷或破魔刀的生存思路",
+        "这是针对法术威胁的可选方案，不是要求所有对局或同时购买"
+      ],
+      "reference": "法术威胁明显时，虞姬可以考虑魔女斗篷或破魔刀来提高生存能力。这是按对局选择的可选方案，不要求每局必出，也不要求同时购买。"
+    },
+    {
+      "id": "Q06",
+      "question": "谁克制虞姬，为什么？",
+      "expected_mode": "graph",
+      "answerable": true,
+      "expected_text_groups": [],
+      "expected_graph": [
+        [
+          "艾琳",
+          "COUNTERS",
+          "虞姬"
+        ]
+      ],
+      "key_points": [
+        "艾琳是图谱收录的机制克制方",
+        "虞姬的物理免疫不覆盖艾琳的法术输出",
+        "不能推断为任何情况下必胜"
+      ],
+      "reference": "当前图谱收录艾琳克制虞姬：虞姬二技能的物理免疫不能覆盖艾琳的法术输出。这是有条件的机制优势，不表示任何情况下都必胜。"
+    },
+    {
+      "id": "Q07",
+      "question": "艾琳克制谁？这是否意味着一定能赢？",
+      "expected_mode": "graph",
+      "answerable": true,
+      "expected_text_groups": [],
+      "expected_graph": [
+        [
+          "艾琳",
+          "COUNTERS",
+          "虞姬"
+        ]
+      ],
+      "key_points": [
+        "当前图谱中艾琳克制虞姬",
+        "不意味着一定能赢，保留对局条件"
+      ],
+      "reference": "当前图谱中，艾琳克制虞姬；这只表示有条件的机制优势，不保证一定能赢，实际结果受对局条件影响。"
+    },
+    {
+      "id": "Q08",
+      "question": "当前知识图谱中，谁克制艾琳？",
+      "expected_mode": "graph",
+      "answerable": false,
+      "expected_text_groups": [],
+      "expected_graph": [],
+      "expected_graph_empty": true,
+      "key_points": [
+        "说明当前图谱没有收录指向艾琳的克制关系",
+        "不能断言现实中没有英雄克制艾琳",
+        "不能把艾琳克制虞姬反向使用"
+      ],
+      "reference": "当前知识图谱没有收录指向艾琳的克制关系。这不表示现实中没有英雄克制艾琳，也不能把艾琳克制虞姬的关系反向使用。"
+    },
+    {
+      "id": "Q09",
+      "question": "为什么艾琳克制虞姬，虞姬面对法术伤害时应该如何调整装备？",
+      "expected_mode": "combined",
+      "answerable": true,
+      "expected_text_groups": [
+        [
+          "yuji_guide_007"
+        ]
+      ],
+      "expected_graph": [
+        [
+          "艾琳",
+          "COUNTERS",
+          "虞姬"
+        ]
+      ],
+      "key_points": [
+        "解释艾琳法术输出与虞姬物理免疫之间的差异",
+        "资料允许法术威胁明显时考虑魔女斗篷或破魔刀",
+        "不能把条件装备描述成对抗艾琳的必胜或固定必出方案",
+        "覆盖原因和装备两个子问题"
+      ],
+      "reference": "艾琳的法术输出不在虞姬二技能物理免疫的覆盖范围内，因此形成有条件的机制优势。面对明显法术威胁，虞姬可以按对局考虑魔女斗篷或破魔刀；这些装备不是固定必出或必胜方案。"
+    },
+    {
+      "id": "Q10",
+      "question": "艾琳大招每一级的准确伤害数值分别是多少？",
+      "expected_mode": "hybrid",
+      "answerable": false,
+      "expected_text_groups": [],
+      "expected_graph": [],
+      "key_points": [
+        "明确现有资料不足以给出逐级准确伤害数值",
+        "不从模型记忆编造数值、伤害系数或版本结论"
+      ],
+      "reference": "现有资料没有提供艾琳大招每一级的准确伤害数值，无法据此给出逐级数值；应说明资料不足，不编造伤害、系数或版本结论。"
+    }
+  ]
+}

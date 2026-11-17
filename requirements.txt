@@ -1,0 +1,24 @@
+# 文档处理、文本/图检索、评测与 Streamlit 页面依赖。
+langchain-core==0.3.80
+langchain-text-splitters==0.3.8
+langsmith==0.4.20
+PyYAML==6.0.2
+openai>=1.86.0,<2.0.0
+jiter==0.10.0
+numpy>=1.25.0,<3.0.0
+# Milvus Lite 的底层依赖，固定为本机可正常加载的官方版本。
+faiss-cpu==1.12.0
+pyarrow==22.0.0
+pymilvus==3.0.2
+milvus-lite==3.2.2
+python-dotenv>=1.0.0,<2.0.0
+jieba==0.42.1
+rank-bm25==0.2.2
+neo4j>=5.26.0,<6.0.0
+streamlit==1.67.0
+# RAGAS 评测；固定与现有 LangChain Core / OpenAI SDK 兼容的适配器。
+ragas==0.4.4
+langchain==0.3.26
+langchain-community==0.3.27
+langchain-openai==0.3.35
+instructor==1.12.0
