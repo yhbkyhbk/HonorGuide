@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from datetime import date, datetime
 import json
 from pathlib import Path
@@ -216,8 +215,4 @@ def prepare_documents(chunk_size: int = 400, chunk_overlap: int = 50) -> dict:
     STORAGE.mkdir(parents=True, exist_ok=True)
     save_documents(STORAGE / "documents.json", parents)
     save_documents(STORAGE / "chunks.json", chunks)
-    return {
-        "documents": len(parents), "chunks": len(chunks),
-        "by_hero": dict(Counter(chunk.metadata["hero"] for chunk in chunks)),
-        "chunk_size": chunk_size, "chunk_overlap": chunk_overlap,
-    }
+    return {"documents": len(parents), "chunks": len(chunks)}

@@ -77,7 +77,6 @@ def start_database() -> None:
                 )
                 if not records or Path(records[0]["value"]).resolve() != NEO4J_DATA_DIR.resolve():
                     raise ValueError("当前 Neo4j 实例未使用本项目数据目录，请停止旧实例后再从页面启动")
-        print("Neo4j 已在运行")
         return
     except ServiceUnavailable:
         pass
@@ -102,7 +101,6 @@ def start_database() -> None:
         try:
             with connect() as driver:
                 driver.verify_connectivity()
-            print("Neo4j 已启动")
             return
         except ServiceUnavailable:
             time.sleep(1)
@@ -141,9 +139,9 @@ def validate_relations(rows: list[dict], documents: dict[str, dict]) -> list[dic
     return list(validated.values())
 
 
-def extract_relations() -> list[dict]:
+def extract_relations(documents: dict[str, dict] | None = None) -> list[dict]:
     """抽取完整克制/对抗小节，校验后返回内存数据，不保存中间文件。"""
-    documents = load_documents()
+    documents = load_documents() if documents is None else documents
     heroes = sorted({doc["metadata"]["hero"] for doc in documents.values()})
     rows = []
     for doc_id, doc in documents.items():
@@ -166,12 +164,7 @@ def extract_relations() -> list[dict]:
         urls = list(dict.fromkeys(re.findall(r"\[[^\]]+\]\((https?://[^)\s]+)\)", text)))
         for row in extracted:
             rows.append({**row, "source_doc_id": doc_id, "source_urls": urls})
-        print(f"{doc_id}：抽取 {len(extracted)} 条待校验关系", flush=True)
-    relations = validate_relations(rows, documents)
-    if not relations:
-        raise ValueError("没有抽取到有效关系，请检查资料和模型输出")
-    print(f"已校验 {len(relations)} 条来源证据")
-    return relations
+    return validate_relations(rows, documents)
 
 
 def load_graph_relations(driver, documents: dict[str, dict]) -> list[dict]:
@@ -207,11 +200,9 @@ def load_graph_relations(driver, documents: dict[str, dict]) -> list[dict]:
 
 
 def build_graph(rows: list[dict] | None = None) -> dict:
-    """同一方向保留一条 COUNTERS 边；新证据合并已有有效来源，不因漏抽而丢失。"""
+    """从当前资料更新图谱，保留仍有原文支持的关系和证据。"""
     documents = load_documents()
-    rows = validate_relations(extract_relations() if rows is None else rows, documents)
-    if not rows:
-        raise ValueError("关系列表为空，请先抽取有效关系")
+    rows = extract_relations(documents) if rows is None else validate_relations(rows, documents)
     heroes = sorted({doc["metadata"]["hero"] for doc in documents.values()})
     with connect() as driver:
         driver.verify_connectivity()
@@ -235,12 +226,16 @@ def build_graph(rows: list[dict] | None = None) -> dict:
             "CREATE CONSTRAINT hero_name_unique IF NOT EXISTS "
             "FOR (h:Hero) REQUIRE h.name IS UNIQUE", database_=DATABASE,
         )
-        driver.execute_query(
-            "UNWIND $heroes AS name MERGE (:Hero {name: name})",
-            heroes=heroes, database_=DATABASE,
-        )
-        driver.execute_query(
-            """UNWIND $relationships AS row
+        with driver.session(database=DATABASE) as session:
+            session.execute_write(write_graph, heroes, relationships)
+    return {"heroes": len(heroes), "relationships": len(relationships), "source_evidences": len(rows)}
+
+
+def write_graph(tx, heroes: list[str], relationships: list[dict]) -> None:
+    """在同一个事务里更新项目关系，移除已失去来源的旧关系。"""
+    tx.run("UNWIND $heroes AS name MERGE (:Hero {name: name})", heroes=heroes).consume()
+    tx.run(
+        """UNWIND $relationships AS row
             MATCH (a:Hero {name: row.head}), (b:Hero {name: row.tail})
             OPTIONAL MATCH (a)-[old:COUNTERS]->(b)
             WITH a, b, row, collect(old) AS existing
@@ -250,33 +245,22 @@ def build_graph(rows: list[dict] | None = None) -> dict:
                 r.evidence_quotes = row.evidence_quotes,
                 r.source_doc_ids = row.source_doc_ids, r.source_files = row.source_files,
                 r.source_urls = row.source_urls
-            REMOVE r.source_doc_id, r.evidence_quote, r.source_file, r.reason, r.condition
-            RETURN count(r) AS processed""",
-            relationships=relationships, database_=DATABASE,
-        )
-    return {"heroes": len(heroes), "relationships": len(relationships), "source_evidences": len(rows)}
+            REMOVE r.source_doc_id, r.evidence_quote, r.source_file, r.reason, r.condition""",
+        relationships=relationships,
+    ).consume()
+    tx.run(
+        """MATCH (a:Hero)-[r:COUNTERS]->(b:Hero)
+        WHERE (r.source_doc_ids IS NOT NULL OR r.source_doc_id IS NOT NULL)
+          AND NOT any(row IN $relationships WHERE row.head = a.name AND row.tail = b.name)
+        DELETE r""",
+        relationships=relationships,
+    ).consume()
 
 
-def parse_question(question: str, heroes: list[str]) -> dict:
-    """识别精确英雄名与三类问题。两位英雄的问题查询双方，避免预设克制方向。"""
-    mentioned = sorted({name for name in heroes if name in question}, key=question.find)
-    if len(mentioned) == 2:
-        return {"kind": "pair", "hero": mentioned[0], "target": mentioned[1]}
-    if len(mentioned) != 1:
-        raise ValueError("请明确输入一至两个已入库的英雄名")
-    hero = mentioned[0]
-    verb = question.find("克制")
-    if verb < 0 and "克星" not in question:
-        raise ValueError("目前支持：谁克制某英雄、某英雄克制谁、两位英雄之间的克制关系")
-    incoming = (
-        "克星" in question or verb < question.find(hero)
-        or "被" in question[question.find(hero) + len(hero):]
-    )
-    return {"kind": "incoming" if incoming else "outgoing", "hero": hero}
-
-
-def retrieve(question: str, *, trace=None) -> tuple[dict, list[dict]]:
-    """使用固定参数化 Cypher 查询一跳关系，返回实际图谱证据。"""
+def retrieve(plan: dict, *, trace=None) -> list[dict]:
+    """校验 LLM 图查询计划，只执行固定参数化的一跳 Cypher。"""
+    if not isinstance(plan, dict) or plan.get("kind") not in {"incoming", "outgoing", "pair"}:
+        raise ValueError("不支持的图查询计划")
     if trace:
         trace.step("Neo4j 连接与认证")
     with connect() as driver:
@@ -287,8 +271,13 @@ def retrieve(question: str, *, trace=None) -> tuple[dict, list[dict]]:
             "MATCH (h:Hero) RETURN h.name AS name", database_=DATABASE
         )
         if trace:
-            trace.step("图问题解析与 Cypher 组装")
-        plan = parse_question(question, [record["name"] for record in records])
+            trace.step("图查询计划校验与 Cypher 组装")
+        heroes = {record["name"] for record in records}
+        if plan.get("hero") not in heroes:
+            raise ValueError("图谱未收录该英雄，请明确问题中的英雄名")
+        plan = {"kind": plan["kind"], "hero": plan["hero"], "target": plan.get("target")}
+        if plan["kind"] == "pair" and (plan["target"] not in heroes or plan["target"] == plan["hero"]):
+            raise ValueError("双英雄图查询需要两个不同的已入库英雄")
         conditions = {
             "incoming": "b.name = $hero",
             "outgoing": "a.name = $hero",
@@ -308,4 +297,4 @@ def retrieve(question: str, *, trace=None) -> tuple[dict, list[dict]]:
         records, _, _ = driver.execute_query(
             cypher, parameters_=plan, database_=DATABASE
         )
-    return {**plan, "cypher": cypher}, [record.data() for record in records]
+    return [record.data() for record in records]

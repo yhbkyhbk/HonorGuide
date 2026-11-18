@@ -4,11 +4,10 @@
   "protocol": {
     "scope": "仅依据当前本地攻略和 Neo4j 图谱；衡量本项目内表现，不代表当前游戏版本或通用能力。",
     "run_settings": {
-      "mode": "auto",
       "top_k": 3,
       "recall_k": 10
     },
-    "retrieval": "先标注后运行。文本 Hit@3 按 expected_text_groups 的可替代证据组判定；文本 Recall@3 按命中的组数计算；图关系按有向三元组去重。无答案题不计入有答案检索指标。",
+    "retrieval": "先标注后运行。文本 Hit@K 按 expected_text_groups 的可替代证据组判定；文本 Recall@K 按命中的组数计算；K 为本次 top_k，默认3；图关系按有向三元组去重。无答案题不计入有答案检索指标。",
     "citations": "项目扩展：先固定分句/列表行与实际引用，再通过 RAGAS llm_factory 的结构化接口逐单元审计。Citation Recall=带引用且被实际引用证据联合充分支持的需引用单元数/全部需引用单元数；Citation Precision=对充分支持的单元提供full或partial支持的引用出现次数/全部实际引用出现次数。不是RAGAS内置指标。",
     "relevancy": "使用 RAGAS 内置 AnswerRelevancy(strictness=3)，由框架反推问题、调用配置中的嵌入模型并计算分数；另外通过RAGAS结构化引用审计记录0/1/2分的对题性和子问题覆盖。",
     "limitations": "生成与评审使用同一个 LLM，存在共同偏差。相似度不是正确率。所有答案、证据和逐项评审都会保留；这是一次小样本基线，不按结果调整题目或修复生产提示词后重算。",

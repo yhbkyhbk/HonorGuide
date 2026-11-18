@@ -19,7 +19,7 @@ jieba.setLogLevel(logging.WARNING)
 
 
 def tokenize(text: str) -> list[str]:
-    """文档与问题使用同样的规则：去来源行、URL、标点和常见停用词，再中文分词。"""
+    """文档与问题使用同样的规则：去来源行和 URL，分词后过滤标点与停用词。"""
     text = re.sub(r"(?m)^(?:参考|机制参考|铭文参考)[：:].*$", "", text)
     text = re.sub(r"https?://[^\s)]+", "", text)
     return [
@@ -32,7 +32,7 @@ def build_index() -> BM25Okapi:
     """保存词频、IDF、长度，以及“词 → 块编号列表”的倒排索引。"""
     chunks = json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
     if not isinstance(chunks, list) or not chunks:
-        raise ValueError("chunks.json 必须是非空分块列表，请先在知识库管理页面处理文档")
+        raise ValueError("文本块为空，请检查攻略后更新知识库")
     # 从现有元数据加入英雄名，避免“艾琳”等名称被拆开，不需要单独的词典文件。
     for hero in {chunk["metadata"]["hero"] for chunk in chunks}:
         jieba.add_word(hero)
@@ -50,24 +50,21 @@ def build_index() -> BM25Okapi:
         encoding="utf-8",
     )
     load_index.cache_clear()
-    print(f"已建立 BM25 索引：{index.corpus_size} 个块，{len(index.idf)} 个词", flush=True)
     return index
 
 
 @lru_cache(maxsize=1)
 def load_index() -> tuple[BM25Okapi, list[dict]]:
-    """从 JSON 恢复统计对象；同一进程反复查询时复用内存缓存。"""
-    if not INDEX_FILE.is_file():
-        build_index()
+    """恢复 BM25 统计和分块，初始化结巴词典并注册英雄名。"""
     chunks = json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
     state = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
     if "postings" not in state:
-        raise ValueError("旧 BM25 索引不含倒排表，请在知识库管理页面重新构建索引")
+        raise ValueError("旧 BM25 索引不含倒排表，请在侧栏更新知识库")
     # 绕过 __init__ 恢复已有统计，避免再次分词和计算 IDF。
     index = BM25Okapi.__new__(BM25Okapi)
     index.__dict__.update(state)
     if not chunks or index.corpus_size != len(chunks):
-        raise ValueError("BM25 索引与分块数量不匹配，请在知识库管理页面重新构建索引")
+        raise ValueError("BM25 索引与分块数量不匹配，请在侧栏更新知识库")
     for hero in {chunk["metadata"]["hero"] for chunk in chunks}:
         jieba.add_word(hero)
     return index, chunks

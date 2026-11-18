@@ -1,6 +1,5 @@
-"""HonorGuide 页面：问答、知识库管理、检索调试和效果评测。"""
+"""HonorGuide 页面：攻略问答与 RAGAS 效果测评。"""
 
-import json
 import math
 from pathlib import Path
 import sys
@@ -17,14 +16,12 @@ from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 from openai import APIError, APIStatusError
 from pymilvus.exceptions import MilvusException
 
-from rag import evaluate as evaluation
-from config import DOCS_DIR, STORAGE
-from rag import documents
+from config import TIMINGS_FILE
+from rag import evaluate as evaluation, knowledge
 from rag.bm25 import retriever as bm25
-from rag.vector import retriever as vector
 from rag.graph import retriever as graph
-from rag.fusion import hybrid_search
-from rag.pipeline import MODES, RequestTrace, ask, save_timing
+from rag.pipeline import RequestTrace, ask, save_timing
+from rag.vector import retriever as vector
 
 
 @st.cache_resource
@@ -94,7 +91,12 @@ export default function(component) {
             p.detected = performance.now() - p.start;
             // 双 rAF 近似首次文本绘制；不声称获得物理屏幕的精确刷新时刻。
             requestAnimationFrame(() => requestAnimationFrame(() => {
-                if (state.pending !== p || !node.isConnected) return;
+                if (state.pending !== p) return;
+                p.scheduled = false;
+                if (!node.isConnected || document.visibilityState !== "visible") {
+                    check();
+                    return;
+                }
                 p.first = performance.now() - p.start;
                 check();
             }));
@@ -102,8 +104,7 @@ export default function(component) {
         if (p.first !== undefined && done) {
             p.sent = true;
             state.send({request_id: p.id, browser_first_render_ms: p.first,
-                browser_text_detected_ms: p.detected, browser_render_wait_ms: p.first - p.detected,
-                browser_submitted_at: new Date(performance.timeOrigin + p.start).toISOString()});
+                browser_text_detected_ms: p.detected, browser_render_wait_ms: p.first - p.detected});
         }
     };
     document.addEventListener("keydown", submit, true);
@@ -132,13 +133,17 @@ def receive_browser_timing():
     if not isinstance(measurement, dict):
         return
     value = measurement.get("browser_first_render_ms")
-    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if type(value) not in (int, float) or not 0 <= value < math.inf:
         return
     for entry in st.session_state.history:
         timings = entry.get("result", {}).get("timings", entry.get("timings", {}))
         if timings.get("request_id") == measurement.get("request_id"):
             if "browser_first_render_ms" not in timings:
-                timings.update(measurement)
+                timings["browser_first_render_ms"] = value
+                for key in ("browser_text_detected_ms", "browser_render_wait_ms"):
+                    duration = measurement.get(key)
+                    if type(duration) in (int, float) and 0 <= duration <= value:
+                        timings[key] = duration
                 server_ms = timings.get("server_first_dispatch_ms")
                 if server_ms is not None:
                     timings["transport_scheduling_render_ms"] = value - server_ms
@@ -170,37 +175,40 @@ def show_timings(timings):
             st.dataframe([{"阶段": row["stage"], "耗时（毫秒）": round(row["duration_ms"], 3)}
                           for row in rows], hide_index=True, width="stretch")
             st.caption(f"首段前各阶段合计：{sum(row['duration_ms'] for row in rows):.3f} 毫秒。"
-                       "阶段互不重叠；未执行的检索分支不列入。")
+                       "主表各阶段互不重叠。")
+        branch_rows = [
+            {"分支": name, "阶段": row["stage"], "耗时（毫秒）": round(row["duration_ms"], 3)}
+            for name, stages in timings.get("parallel_branches", {}).items()
+            for row in stages
+        ]
+        if branch_rows:
+            st.caption("并行召回明细。两路耗时可能重叠，实际等待时间已计入主表。")
+            st.dataframe(branch_rows, hide_index=True, width="stretch")
         gap = timings.get("transport_scheduling_render_ms")
         if gap is not None:
             st.caption(f"浏览器总耗时与服务端首段下发耗时之差：{gap:.3f} 毫秒，"
                        "包含提交传输、调度、返回传输和渲染等开销，无法据此单独拆分网络耗时。")
         if timings.get("complete_ms") is not None:
             st.caption(f"服务端完整回答耗时：{timings['complete_ms'] / 1000:.3f} 秒（另计）。")
-        st.caption(f"请求编号：{timings['request_id']} · 日志：data/storage/request_timings.jsonl")
+        log_path = TIMINGS_FILE.relative_to(PROJECT_ROOT).as_posix()
+        st.caption(f"请求编号：{timings['request_id']} · 日志：{log_path}")
 
 MODE_NAMES = {
-    "auto": "自动选择", "hybrid": "文本混合检索",
+    "hybrid": "文本混合检索",
     "graph": "图检索", "combined": "文本 + 图联合检索",
-}
-
-
-MODE_HELP = {
-    "auto": "根据问题选择文本、图或联合检索。",
-    "hybrid": "结合关键词与向量检索，适合技能、装备和打法问题。",
-    "graph": "查询英雄之间的克制方向、原因和适用条件。",
-    "combined": "同时查询攻略和克制关系，适合包含多个子问题的提问。",
 }
 
 
 def error_message(exc: Exception) -> str:
     """展示可操作的提示，避免把接口原始响应和连接凭据显示到页面。"""
+    if isinstance(exc, knowledge.KnowledgeUnavailableError):
+        return str(exc)
     if isinstance(exc, MilvusException):
-        return "Milvus 操作失败，请在知识库管理中检查连接配置并重新连接或构建向量库。"
+        return "Milvus 操作失败，请检查连接配置。若修改了攻略或嵌入模型，请在侧栏更新知识库。"
     if isinstance(exc, AuthError):
         return "图数据库认证失败，请检查 .env 中的 Neo4j 用户名和密码。"
     if isinstance(exc, ServiceUnavailable):
-        return "无法连接图数据库，请点击侧栏的“启动 / 检查图数据库”。"
+        return "无法连接图数据库，请检查 Neo4j 服务及 .env 中的连接配置。"
     if isinstance(exc, Neo4jError):
         return "图数据库查询失败，请检查数据库状态和已导入的英雄关系。"
     if isinstance(exc, APIStatusError):
@@ -208,10 +216,62 @@ def error_message(exc: Exception) -> str:
     if isinstance(exc, APIError):
         return "模型接口连接失败，请检查网络与 .env 中的接口配置后重试。"
     if isinstance(exc, FileNotFoundError):
-        return "缺少本地数据或索引，请先完成文档处理及索引构建。"
+        return "缺少本地数据或索引，请检查攻略文件，并在侧栏更新知识库。"
     if isinstance(exc, ValueError):
         return f"无法完成请求：{exc}"
     return f"请求未完成（{type(exc).__name__}），请检查当前环境和本地索引。"
+
+
+@st.cache_resource
+def ensure_graph_database() -> None:
+    """页面首次加载时检查并启动图数据库，页面重跑时复用结果。"""
+    graph.start_database()
+
+
+@st.cache_resource(show_spinner="正在加载检索索引……")
+def prepare_search_indexes() -> tuple[str, ...]:
+    """页面首次打开时预热 BM25 和 Milvus。"""
+    warnings = []
+    with knowledge.read_access():
+        try:
+            bm25.load_index()
+        except (OSError, ValueError, TypeError, KeyError):
+            warnings.append("BM25 索引未就绪，请在侧栏更新知识库。")
+        try:
+            if vector.get_client().has_collection(collection_name=vector.MILVUS_COLLECTION):
+                vector.load_index()
+                return tuple(warnings)
+        except (MilvusException, OSError, ValueError, ImportError):
+            pass
+    warnings.append("Milvus 向量索引未就绪。首次使用请在侧栏更新知识库，已有索引时请检查 Milvus 连接配置。")
+    return tuple(warnings)
+
+
+def show_knowledge_update() -> None:
+    state = knowledge.update_state()
+    if not st.button(
+        "更新知识库", key="update_knowledge", disabled=state == "updating", width="stretch",
+        help="重新读取攻略并构建 BM25、Milvus 和 Neo4j 数据。部分步骤会调用模型接口。",
+    ):
+        if state == "pending":
+            st.warning("上次更新未完成，请重新更新后再使用问答或测评。")
+        return
+
+    progress = st.progress(0, text="准备更新知识库……")
+    try:
+        result = knowledge.rebuild(
+            lambda step, label: progress.progress((step - 1) / 4, text=f"{step}/4 · {label}"),
+        )
+    except Exception as exc:
+        st.error("知识库更新未完成。" + error_message(exc))
+    else:
+        prepare_search_indexes.clear()
+        progress.empty()
+        st.success(
+            f"知识库已更新。{result['documents']} 篇攻略 · {result['chunks']} 个文本块 · "
+            f"{result['terms']} 个 BM25 词项 · {result['vectors']} 条向量 · "
+            f"{result['relationships']} 条图谱关系"
+        )
 
 
 def show_result(result: dict, render_answer: bool = True) -> None:
@@ -227,6 +287,8 @@ def show_result(result: dict, render_answer: bool = True) -> None:
         f"{text_count} 个文本块 / {result['graph_relations']} 条图关系 · "
         f"完整回答 {full_seconds:.2f} 秒"
     )
+    if result.get("routing", {}).get("reason"):
+        st.caption("检索选择依据：" + result["routing"]["reason"])
     for note in result["notes"]:
         st.warning(note)
     show_timings(result["timings"])
@@ -251,115 +313,9 @@ def show_result(result: dict, render_answer: bool = True) -> None:
                 st.markdown(f"[参考来源 {index}]({url})")
             st.divider()
 
-    with st.expander("检索调试信息"):
-        st.json({
-            "requested_mode": result["requested_mode"],
-            "selected_mode": result["selected_mode"],
-            "used_mode": result["used_mode"],
-            "route_reason": result["route_reason"],
-            "text_query": result["text_query"],
-            "text_candidates": result["text_candidates"],
-            "graph_status": result["graph_status"],
-            "graph_plan": result["graph_plan"],
-            "timings": result["timings"],
-        }, expanded=True)
 
-
-def index_status(kind: str) -> str:
-    if kind == "vector":
-        try:
-            return vector.get_status()["status"]
-        except (MilvusException, OSError, ValueError, ImportError):
-            return "Milvus 连接失败，请检查连接配置"
-    chunks = STORAGE / "chunks.json"
-    if not chunks.is_file():
-        return "请先处理文档"
-    if not bm25.INDEX_FILE.is_file():
-        return "尚未构建"
-    if bm25.INDEX_FILE.stat().st_mtime_ns < chunks.stat().st_mtime_ns:
-        return "文档已更新，需要重建"
-    return "就绪"
-
-def perform(label: str, action, key: str = "manage_result") -> None:
-    st.session_state.pop(key, None)
-    try:
-        with st.spinner(label + "……"):
-            result = action()
-        st.session_state[key] = {"ok": True, "label": label, "result": result}
-    except (APIError, MilvusException, Neo4jError, OSError, ValueError, RuntimeError, ImportError, KeyError) as exc:
-        st.session_state[key] = {"ok": False, "label": label, "error": error_message(exc)}
-
-
-def show_operation(key: str) -> None:
-    entry = st.session_state.get(key)
-    if not entry:
-        return
-    if entry["ok"]:
-        st.success(entry["label"] + "完成。")
-        if entry["result"] is not None:
-            st.json(entry["result"])
-    else:
-        st.error(entry["error"])
-
-
-def prepare_current_documents(chunk_size: int, chunk_overlap: int) -> dict:
-    result = documents.prepare_documents(chunk_size, chunk_overlap)
-    bm25.load_index.cache_clear()
-    st.session_state.pop("search_result", None)
-    st.session_state.pop("graph_preview", None)
-    return result
-
-
-def build_vector_index() -> dict:
-    return vector.build_index()
-
-
-def build_bm25_index() -> dict:
-    index = bm25.build_index()
-    return {"chunks": index.corpus_size, "terms": len(index.idf)}
-
-
-def build_current_graph() -> dict:
-    graph.start_database()
-    return graph.build_graph()
-
-
-def show_management() -> None:
-    st.subheader("知识库管理")
-    files = sorted(DOCS_DIR.glob("*.md"))
-    st.caption("原始攻略：" + ("、".join(path.name for path in files) or "暂无，请放入 data/docs"))
-    st.markdown("**1. 文档处理**")
-    left, right = st.columns(2)
-    chunk_size = left.number_input("分块字符数", min_value=100, max_value=2000, value=400, step=50, key="chunk_size")
-    chunk_overlap = right.number_input("重叠字符数", min_value=0, max_value=500, value=50, step=10, key="chunk_overlap")
-    if st.button("处理文档", key="prepare_docs"):
-        perform("文档处理", lambda: prepare_current_documents(chunk_size, chunk_overlap))
-
-    st.markdown("**2. Milvus 向量库与文本索引**")
-    if st.button("连接 / 检查 Milvus", key="connect_milvus"):
-        perform("Milvus 连接检查", vector.connection_info)
-    st.caption("处理文档后构建 Milvus 向量库和 BM25 索引；向量库使用 HNSW / COSINE，构建会调用嵌入接口。")
-    left, right = st.columns(2)
-    if left.button("构建 Milvus 向量库", key="build_vector"):
-        perform("Milvus 向量库构建", build_vector_index)
-    if right.button("构建 BM25 索引", key="build_bm25"):
-        perform("BM25 索引构建", build_bm25_index)
-    st.write("Milvus 向量库：" + index_status("vector") + "；BM25 索引：" + index_status("bm25"))
-
-    st.markdown("**3. 英雄关系图谱**")
-    st.caption("抽取会调用模型接口；构建时重新抽取、校验并合并已有有效来源。左侧可单独启动数据库。")
-    left, right = st.columns(2)
-    if left.button("预览抽取关系", key="preview_graph"):
-        perform("关系抽取", lambda: graph.extract_relations(), "graph_preview")
-    if right.button("构建 / 更新图谱", key="build_graph"):
-        perform("图谱构建", build_current_graph)
-    show_operation("manage_result")
-    with st.expander("最近抽取的图关系"):
-        show_operation("graph_preview")
-
-
-def show_chat(mode: str, top_k: int, recall_k: int) -> None:
-    st.caption("请写明英雄名称；每次提问独立检索，历史记录仅用于展示。")
+def show_chat(ready: bool) -> None:
+    st.caption("LLM 根据问题语义自动选择检索方式；每次提问独立检索，历史记录仅用于展示。")
     for entry in st.session_state.history:
         with st.chat_message("user"):
             st.markdown(entry["question"])
@@ -373,9 +329,6 @@ def show_chat(mode: str, top_k: int, recall_k: int) -> None:
                     st.warning("以上内容生成中断或未通过引用校验，请勿视为完整回答。")
                 st.error(entry["error"])
                 show_timings(entry.get("timings", {}))
-    ready = mode == "graph" or all(index_status(kind) == "就绪" for kind in ("vector", "bm25"))
-    if not ready:
-        st.info("请先到“知识库管理”处理文档并构建两个文本索引，或选择纯图检索。")
     question = st.chat_input("例如：为什么艾琳克制虞姬，虞姬应该如何调整装备？", disabled=not ready,
                              key="chat_question", on_submit=record_request_start, submit_mode="submit")
     if not question:
@@ -397,9 +350,8 @@ def show_chat(mode: str, top_k: int, recall_k: int) -> None:
             output.markdown("".join(pieces))
         try:
             with st.spinner("正在检索资料并生成回答……"):
-                entry["result"] = ask(question, mode=mode, top_k=top_k, recall_k=recall_k,
-                                      on_token=display_token, trace=trace)
-        except (APIError, MilvusException, Neo4jError, OSError, ValueError, RuntimeError, ImportError, KeyError) as exc:
+                entry["result"] = ask(question, on_token=display_token, trace=trace)
+        except (APIError, MilvusException, Neo4jError, ServiceUnavailable, OSError, ValueError, RuntimeError, ImportError, KeyError) as exc:
             entry["error"] = error_message(exc)
             entry["partial_answer"] = "".join(pieces)
             trace.mark("failed")
@@ -419,50 +371,23 @@ def show_chat(mode: str, top_k: int, recall_k: int) -> None:
         st.empty()
 
 
-def retrieve_only(question: str, method: str, top_k: int, recall_k: int) -> dict:
-    if not question.strip():
-        raise ValueError("请输入检索问题")
-    question = question.strip()
-    if method == "graph":
-        plan, facts = graph.retrieve(question)
-        return {"question": question, "method": method, "plan": plan, "facts": facts}
-    required = ("bm25", "vector") if method == "hybrid" else (method,)
-    if any(index_status(kind) != "就绪" for kind in required):
-        raise ValueError("索引尚未就绪，请先到知识库管理构建对应索引")
-    if method == "bm25":
-        rows = bm25.search(question, top_k)
-    elif method == "vector":
-        rows = vector.search(question, top_k)
-    else:
-        rows = hybrid_search(question, top_k, recall_k)
-    return {"question": question, "method": method, "results": rows}
-
-
-def show_search(top_k: int, recall_k: int) -> None:
-    st.subheader("检索调试")
-    st.caption("直接查看检索结果；本功能不调用对话模型生成答案。")
-    method = st.selectbox(
-        "检索方法", ("bm25", "vector", "hybrid", "graph"),
-        format_func={"bm25": "BM25 关键词", "vector": "向量", "hybrid": "RRF 混合", "graph": "图关系"}.__getitem__,
-        key="search_method",
-    )
-    question = st.text_input("检索问题", key="search_question")
-    if st.button("执行检索", key="run_search"):
-        perform("检索", lambda: retrieve_only(question, method, top_k, recall_k), "search_result")
-    show_operation("search_result")
-
-
 def percent(value) -> str:
     return "—" if value is None else f"{value:.1%}"
 
 
-def show_evaluation() -> None:
-    st.subheader("效果评测")
+def show_evaluation(ready: bool) -> None:
+    st.subheader("效果测评")
     try:
         data = evaluation.load_dataset()
     except (OSError, ValueError, KeyError) as exc:
         st.error(error_message(exc))
         return
+    settings = data.get("run_settings", data["protocol"]["run_settings"])
+    with st.expander("测评检索参数"):
+        top_k = st.slider("最终文本块数", 1, 10, settings["top_k"], key="evaluation_top_k")
+        recall_k = st.slider("每路文本召回数", 10, 30, settings["recall_k"], key="evaluation_recall_k")
+        st.caption("仅用于本次测评，问答使用默认 3 / 10。检索方式始终由 LLM 选择；"
+                   "参数变化后需点击“重新评测”。下方已有指标仍对应保存结果时的参数。")
     st.dataframe(
         [{"编号": row["id"], "问题": row["question"], "资料中有答案": row["answerable"]} for row in data["cases"]],
         hide_index=True,
@@ -470,20 +395,20 @@ def show_evaluation() -> None:
     st.caption("使用 RAGAS 0.4.4。继续评测复用已有回答和有效的逐指标断点；旧自定义分数会单独归档，"
                "并重新计算 RAGAS 指标。重新评测会重新检索、生成回答并覆盖结果。")
     left, right = st.columns(2)
-    resume = left.button("运行 / 继续评测", key="run_evaluation")
-    restart = right.button("重新评测（覆盖结果）", key="restart_evaluation")
+    resume = left.button("运行 / 继续评测", key="run_evaluation", disabled=not ready)
+    restart = right.button("重新评测（覆盖结果）", key="restart_evaluation", disabled=not ready)
     if resume or restart:
         progress = st.progress(0.0, text="准备评测")
         def update(done, total, case_id, status):
             progress.progress(done / total if total else 1.0, text=f"{case_id} · {status}（{done}/{total}）")
         try:
-            summary = evaluation.run(restart=restart, progress=update)
+            summary = evaluation.run(restart=restart, progress=update, top_k=top_k, recall_k=recall_k)
             data = evaluation.load_dataset()
             if summary["completed"] == summary["total"]:
                 st.success(f"已完成 {summary['completed']} 道题。")
             else:
                 st.warning("部分题目未完成，断点已保存；可点击“运行 / 继续评测”重试。")
-        except (APIError, MilvusException, Neo4jError, OSError, ValueError, RuntimeError, ImportError, KeyError) as exc:
+        except (APIError, MilvusException, Neo4jError, ServiceUnavailable, OSError, ValueError, RuntimeError, ImportError, KeyError) as exc:
             st.error(error_message(exc))
     summary = data.get("summary")
     if summary and data.get("engine", {}).get("name") == "ragas":
@@ -500,11 +425,13 @@ def show_evaluation() -> None:
         st.caption("以上为 RAGAS 内置指标，按有效题取平均。无答案题或无证据时，忠实度和上下文指标不适用。"
                    "相关性分可能惩罚恰当拒答，需结合拒答通过率阅读。")
         left, middle, right = st.columns(3)
-        left.metric("检索检查 · 文本 Hit@3", percent(summary.get("text_hit_at_3")))
+        retrieval_k = summary.get("retrieval_k", 3)
+        left.metric(f"检索检查 · 文本 Hit@{retrieval_k}",
+                    percent(summary.get("text_hit_at_k", summary.get("text_hit_at_3"))))
         middle.metric("引用审计 · 支持率", percent(summary.get("citation_precision")))
         right.metric("引用审计 · 覆盖率", percent(summary.get("citation_recall")))
         st.caption("检索检查是项目规则；引用审计通过 RAGAS 的结构化 LLM 接口完成，属于项目扩展。"
-                   "Faithfulness 不等于引用支持率，Context Precision 也不等于 Precision@3。")
+                   "Faithfulness 不等于引用支持率，Context Precision 也不等于 Precision@K。")
         with st.expander("全部指标"):
             st.json(summary)
     elif summary:
@@ -530,32 +457,29 @@ def main() -> None:
     st.caption("王者荣耀攻略问答 · 艾琳 / 虞姬")
     st.session_state.setdefault("history", [])
     receive_browser_timing()
+    try:
+        with st.spinner("正在检查图数据库……"):
+            ensure_graph_database()
+    except (Neo4jError, ServiceUnavailable, ValueError, OSError) as exc:
+        st.warning(error_message(exc) + " 自动或联合模式可在图查询失败时回退到文本检索。")
     with st.sidebar:
-        page = st.radio("功能", ("攻略问答", "知识库管理", "检索调试", "效果评测"), key="page")
-        st.divider()
-        mode = st.selectbox("检索方式", MODES, format_func=MODE_NAMES.__getitem__, key="mode")
-        st.caption(MODE_HELP[mode])
-        with st.expander("文本检索参数"):
-            top_k = st.slider("最终文本块数", 1, 10, 3, key="top_k")
-            recall_k = st.slider("每路文本召回数", 10, 30, 10, key="recall_k")
-            st.caption("纯图检索不使用这两个文本参数。")
-        if st.button("启动 / 检查图数据库", key="start_db"):
-            try:
-                with st.spinner("正在检查图数据库……"):
-                    graph.start_database()
-                st.success("图数据库已连接。")
-            except (Neo4jError, ValueError, OSError) as exc:
-                st.error(error_message(exc))
-        if st.button("清空问答记录", key="clear_history"):
-            st.session_state.history = []
+        page = st.radio("功能", ("攻略问答", "效果测评"), key="page")
+        show_knowledge_update()
+    ready = knowledge.update_state() == "ready"
+    if ready and not (bm25.load_index.cache_info().currsize and vector.load_index.cache_info().currsize):
+        try:
+            index_warnings = prepare_search_indexes()
+        except knowledge.KnowledgeUnavailableError:
+            ready = False
+        else:
+            for warning in index_warnings:
+                st.warning(warning)
+    if not ready:
+        st.info("知识库更新完成后可继续问答和测评。")
     if page == "攻略问答":
-        show_chat(mode, top_k, recall_k)
-    elif page == "知识库管理":
-        show_management()
-    elif page == "检索调试":
-        show_search(top_k, recall_k)
+        show_chat(ready)
     else:
-        show_evaluation()
+        show_evaluation(ready)
 
 
 if __name__ == "__main__":

@@ -3,9 +3,8 @@
 import json
 import re
 
-from openai import OpenAI
-
-from config import API_KEY, BASE_URL, LLM_MODEL
+from config import LLM_MODEL
+from .model_client import get_model_client
 
 SYSTEM_PROMPT = """你是依据资料回答的游戏攻略助手，只能使用提供的证据，不补充模型记忆。
 文本证据用于技能、出装与打法；图谱证据中的 head COUNTERS tail 表示有条件的机制优势。
@@ -20,16 +19,13 @@ def call_llm(
     system: str, user: str, json_mode: bool = False,
     temperature: float = 0.1, max_tokens: int = 2048,
 ) -> str:
-    if not API_KEY:
-        raise ValueError("请先在 .env 配置 API_KEY 或 DASHSCOPE_API_KEY")
     options = {"response_format": {"type": "json_object"}} if json_mode else {}
-    with OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=60, max_retries=1) as client:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=temperature, max_tokens=max_tokens,
-            extra_body={"enable_thinking": False}, **options,
-        )
+    response = get_model_client().chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=temperature, max_tokens=max_tokens,
+        extra_body={"enable_thinking": False}, **options,
+    )
     if json_mode and response.choices[0].finish_reason == "length":
         raise ValueError("模型 JSON 输出被截断，请保留断点后重试")
     content = response.choices[0].message.content
@@ -98,8 +94,6 @@ def generate_answer(
         answer = "当前检索未找到支持该问题的证据；图谱未收录不表示该关系不存在。"
         emit(answer)
     else:
-        if not API_KEY:
-            raise ValueError("请先在 .env 配置 API_KEY 或 DASHSCOPE_API_KEY")
         if trace:
             trace.step("提示词组装与模型客户端准备")
         payload = json.dumps({
@@ -107,37 +101,37 @@ def generate_answer(
         }, ensure_ascii=False)
         parts = []
         first_sent = False
-        with OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=60, max_retries=1) as client:
-            if trace:
-                trace.step("模型请求至首段文本（含网络与重试）")
-                trace.mark("model_request")
-            with client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                          {"role": "user", "content": payload}],
-                temperature=0.1, max_tokens=2048, stream=True,
-                extra_body={"enable_thinking": False},
-            ) as stream:
-                for chunk in stream:
-                    if chunk.choices and chunk.choices[0].finish_reason == "length":
-                        raise ValueError("回答达到输出长度限制，内容尚未完整生成，请缩小问题范围后重试")
-                    # 角色、用量及推理字段不算回答首 token；纯空白不触发首次显示。
-                    text = chunk.choices[0].delta.content if chunk.choices else None
-                    if not text:
+        client = get_model_client()
+        if trace:
+            trace.step("模型请求至首段文本（含网络与重试）")
+            trace.mark("model_request")
+        with client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                      {"role": "user", "content": payload}],
+            temperature=0.1, max_tokens=2048, stream=True,
+            extra_body={"enable_thinking": False},
+        ) as stream:
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].finish_reason == "length":
+                    raise ValueError("回答达到输出长度限制，内容尚未完整生成，请缩小问题范围后重试")
+                # 角色、用量及推理字段不算回答首 token；纯空白不触发首次显示。
+                text = chunk.choices[0].delta.content if chunk.choices else None
+                if not text:
+                    continue
+                parts.append(text)
+                if not first_sent:
+                    if not "".join(parts).strip():
                         continue
-                    parts.append(text)
-                    if not first_sent:
-                        if not "".join(parts).strip():
-                            continue
-                        if trace:
-                            trace.mark("model_first_text")
-                            trace.step("首段文本下发")
-                        emit("".join(parts))
-                        first_sent = True
-                        if trace:
-                            trace.step("后续文本生成与下发")
-                    else:
-                        emit(text)
+                    if trace:
+                        trace.mark("model_first_text")
+                        trace.step("首段文本下发")
+                    emit("".join(parts))
+                    first_sent = True
+                    if trace:
+                        trace.step("后续文本生成与下发")
+                else:
+                    emit(text)
         answer = "".join(parts).strip()
         if not answer:
             raise ValueError("模型返回了空内容")
