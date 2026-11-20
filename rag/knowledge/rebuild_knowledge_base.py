@@ -5,10 +5,10 @@ from threading import Lock
 from uuid import uuid4
 
 from config import STORAGE
-from . import documents
-from .bm25 import retriever as bm25
-from .graph import retriever as graph
-from .vector import retriever as vector
+from .. import search_bm25_keywords as bm25
+from .. import search_milvus_vectors as vector
+from .. import search_neo4j_graph as graph
+from .prepare_documents import prepare_documents
 
 
 UPDATE_PENDING = STORAGE / ".knowledge_update_pending"
@@ -68,20 +68,21 @@ def rebuild(on_step=None) -> dict:
             on_step(1, "读取并切分攻略")
         UPDATE_PENDING.parent.mkdir(parents=True, exist_ok=True)
         UPDATE_PENDING.touch()
-        prepared = documents.prepare_documents()
+        parents, chunks = prepare_documents()
         if on_step:
             on_step(2, "重建 BM25 索引")
-        keywords = bm25.build_index()
+        keywords = bm25.build_index(chunks)
         if on_step:
             on_step(3, "重建 Milvus 向量索引")
-        vectors = vector.build_index()
+        vectors = vector.build_index(chunks)
         if on_step:
             on_step(4, "更新 Neo4j 英雄关系")
         graph.start_database()
-        relations = graph.build_graph()
+        relationships = graph.build_graph(parents)
         REVISION_FILE.write_text(uuid4().hex + "\n", encoding="ascii")
         UPDATE_PENDING.unlink()
-        return {**prepared, "terms": len(keywords.idf), "vectors": vectors["vectors"], **relations}
+        return {"documents": len(parents), "chunks": len(chunks), "terms": len(keywords.idf),
+                "vectors": vectors, "relationships": relationships}
     finally:
         with _state_lock:
             _updating = False

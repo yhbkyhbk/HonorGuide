@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+from threading import Lock
 import time
 from urllib.parse import urlsplit
 
@@ -17,8 +19,9 @@ from config import (
     NEO4J_URI as URI, NEO4J_USERNAME as USERNAME, NEO4J_PASSWORD as PASSWORD,
     NEO4J_DATABASE as DATABASE, NEO4J_HOME, JAVA_HOME, NEO4J_DATA_DIR,
 )
-from ..documents import load_parent_records as load_documents
-from ..generation import call_llm
+from infrastructure.call_model_api import chat_completion
+
+from .knowledge.prepare_documents import MARKDOWN_LINK
 
 EXTRACT_PROMPT = """只依据输入攻略，抽取英雄之间有证据的机制克制关系。
 COUNTERS 表示技能或伤害机制上的相对优势，不表示任何条件下都能获胜。
@@ -31,14 +34,31 @@ COUNTERS 表示技能或伤害机制上的相对优势，不表示任何条件�
 没有证据时返回 {"relations":[]}。"""
 
 
-def connect():
-    """返回驱动，连接信息来自 .env；密码不会打印或写入关系数据。"""
-    if not PASSWORD:
-        raise ValueError("请在 .env 配置 NEO4J_PASSWORD")
-    return GraphDatabase.driver(
-        URI, auth=(USERNAME, PASSWORD), connection_timeout=5,
-        connection_acquisition_timeout=5, max_transaction_retry_time=5,
-    )
+_driver = None
+_driver_lock = Lock()
+
+
+def get_driver():
+    """共享 Neo4j 连接池，按查询获取连接。"""
+    global _driver
+    with _driver_lock:
+        if _driver is None:
+            if not PASSWORD:
+                raise ValueError("请在 .env 配置 NEO4J_PASSWORD")
+            _driver = GraphDatabase.driver(
+                URI, auth=(USERNAME, PASSWORD), connection_timeout=5,
+                connection_acquisition_timeout=5, max_transaction_retry_time=5,
+            )
+        return _driver
+
+
+@atexit.register
+def close_driver() -> None:
+    global _driver
+    with _driver_lock:
+        if _driver is not None:
+            _driver.close()
+            _driver = None
 
 
 def prepare_local_config() -> Path:
@@ -67,19 +87,21 @@ def prepare_local_config() -> Path:
 
 def start_database() -> None:
     """启动已安装的本地便携实例；不修改系统服务或全局环境变量。"""
+    driver = get_driver()
+    local = urlsplit(URI).hostname in {"localhost", "127.0.0.1", "::1"}
     try:
-        with connect() as driver:
-            driver.verify_connectivity()
-            if urlsplit(URI).hostname in {"localhost", "127.0.0.1", "::1"}:
-                records, _, _ = driver.execute_query(
-                    "SHOW SETTINGS YIELD name, value WHERE name = 'server.directories.data' RETURN value",
-                    database_="system",
-                )
-                if not records or Path(records[0]["value"]).resolve() != NEO4J_DATA_DIR.resolve():
-                    raise ValueError("当前 Neo4j 实例未使用本项目数据目录，请停止旧实例后再从页面启动")
+        driver.verify_connectivity()
+        if local:
+            records, _, _ = driver.execute_query(
+                "SHOW SETTINGS YIELD name, value WHERE name = 'server.directories.data' RETURN value",
+                database_="system",
+            )
+            if not records or Path(records[0]["value"]).resolve() != NEO4J_DATA_DIR.resolve():
+                raise ValueError("当前 Neo4j 实例未使用本项目数据目录，请停止旧实例后再从页面启动")
         return
     except ServiceUnavailable:
-        pass
+        if not local:
+            raise
     home = NEO4J_HOME
     java_home = JAVA_HOME
     java = java_home / "bin" / ("java.exe" if os.name == "nt" else "java")
@@ -99,8 +121,7 @@ def start_database() -> None:
         if process.poll() is not None:
             raise ValueError(f"Neo4j 启动失败，请查看 {NEO4J_DATA_DIR / 'logs' / 'console.log'}")
         try:
-            with connect() as driver:
-                driver.verify_connectivity()
+            driver.verify_connectivity()
             return
         except ServiceUnavailable:
             time.sleep(1)
@@ -129,7 +150,7 @@ def validate_relations(rows: list[dict], documents: dict[str, dict]) -> list[dic
             raise ValueError("关系证据无法在对应原文中找到")
         if not all(hero in row["evidence_quote"] for hero in (row["head"], row["tail"])):
             raise ValueError("证据必须明确包含关系两端的英雄名")
-        allowed_urls = re.findall(r"\[[^\]]+\]\((https?://[^)\s]+)\)", doc["page_content"])
+        allowed_urls = MARKDOWN_LINK.findall(doc["page_content"])
         source_urls = list(dict.fromkeys(row.get("source_urls", allowed_urls)))
         if any(url not in allowed_urls for url in source_urls):
             raise ValueError("来源链接不在对应文档中")
@@ -139,9 +160,8 @@ def validate_relations(rows: list[dict], documents: dict[str, dict]) -> list[dic
     return list(validated.values())
 
 
-def extract_relations(documents: dict[str, dict] | None = None) -> list[dict]:
-    """抽取完整克制/对抗小节，校验后返回内存数据，不保存中间文件。"""
-    documents = load_documents() if documents is None else documents
+def extract_relations(documents: dict[str, dict]) -> list[dict]:
+    """从攻略的克制和对抗小节抽取关系候选。"""
     heroes = sorted({doc["metadata"]["hero"] for doc in documents.values()})
     rows = []
     for doc_id, doc in documents.items():
@@ -153,18 +173,26 @@ def extract_relations(documents: dict[str, dict] | None = None) -> list[dict]:
         )
         if not text.strip():
             continue
-        result = json.loads(call_llm(
-            EXTRACT_PROMPT,
-            f"英雄名单：{json.dumps(heroes, ensure_ascii=False)}\n资料：\n{text}",
-            json_mode=True,
-        ))
+        response = chat_completion(
+            [{"role": "system", "content": EXTRACT_PROMPT},
+             {"role": "user", "content": f"英雄名单：{json.dumps(heroes, ensure_ascii=False)}\n资料：\n{text}"}],
+            response_format={"type": "json_object"},
+        )
+        choice = response.choices[0] if response.choices else None
+        if choice is None or choice.finish_reason == "length" or not choice.message.content:
+            raise ValueError(f"{doc_id} 的关系抽取输出为空或被截断")
+        result = json.loads(choice.message.content)
+        if not isinstance(result, dict):
+            raise ValueError(f"{doc_id} 的关系抽取输出需要是 JSON 对象")
         extracted = result.get("relations")
         if not isinstance(extracted, list):
             raise ValueError(f"{doc_id} 的模型输出缺少 relations 列表")
-        urls = list(dict.fromkeys(re.findall(r"\[[^\]]+\]\((https?://[^)\s]+)\)", text)))
+        urls = list(dict.fromkeys(MARKDOWN_LINK.findall(text)))
         for row in extracted:
+            if not isinstance(row, dict):
+                raise ValueError(f"{doc_id} 的关系数据需要是 JSON 对象")
             rows.append({**row, "source_doc_id": doc_id, "source_urls": urls})
-    return validate_relations(rows, documents)
+    return rows
 
 
 def load_graph_relations(driver, documents: dict[str, dict]) -> list[dict]:
@@ -185,7 +213,7 @@ def load_graph_relations(driver, documents: dict[str, dict]) -> list[dict]:
             doc = documents.get(doc_id)
             if doc is None:
                 continue
-            urls = re.findall(r"\[[^\]]+\]\((https?://[^)\s]+)\)", doc["page_content"])
+            urls = MARKDOWN_LINK.findall(doc["page_content"])
             row = {
                 "head": record["head"], "tail": record["tail"], "relation": "COUNTERS",
                 "source_doc_id": doc_id, "evidence_quote": quote,
@@ -199,36 +227,34 @@ def load_graph_relations(driver, documents: dict[str, dict]) -> list[dict]:
     return rows
 
 
-def build_graph(rows: list[dict] | None = None) -> dict:
+def build_graph(documents: dict[str, dict]) -> int:
     """从当前资料更新图谱，保留仍有原文支持的关系和证据。"""
-    documents = load_documents()
-    rows = extract_relations(documents) if rows is None else validate_relations(rows, documents)
+    extracted = validate_relations(extract_relations(documents), documents)
     heroes = sorted({doc["metadata"]["hero"] for doc in documents.values()})
-    with connect() as driver:
-        driver.verify_connectivity()
-        rows = validate_relations(load_graph_relations(driver, documents) + rows, documents)
-        grouped = {}
-        for row in rows:
-            grouped.setdefault((row["head"], row["tail"]), []).append(row)
-        relationships = []
-        for (head, tail), evidence in grouped.items():
-            relationships.append({
-                "head": head, "tail": tail,
-                # 五个列表使用相同下标，将原因、条件和原文关联到各自来源。
-                "reasons": [item["reason"] for item in evidence],
-                "conditions": [item["condition"] for item in evidence],
-                "source_doc_ids": [item["source_doc_id"] for item in evidence],
-                "evidence_quotes": [item["evidence_quote"] for item in evidence],
-                "source_files": [item["source_file"] for item in evidence],
-                "source_urls": list(dict.fromkeys(url for item in evidence for url in item["source_urls"])),
-            })
-        driver.execute_query(
-            "CREATE CONSTRAINT hero_name_unique IF NOT EXISTS "
-            "FOR (h:Hero) REQUIRE h.name IS UNIQUE", database_=DATABASE,
-        )
-        with driver.session(database=DATABASE) as session:
-            session.execute_write(write_graph, heroes, relationships)
-    return {"heroes": len(heroes), "relationships": len(relationships), "source_evidences": len(rows)}
+    driver = get_driver()
+    grouped = {}
+    for row in load_graph_relations(driver, documents) + extracted:
+        grouped.setdefault((row["head"], row["tail"]), {})[row["source_doc_id"]] = row
+    relationships = []
+    for (head, tail), by_source in grouped.items():
+        evidence = list(by_source.values())
+        relationships.append({
+            "head": head, "tail": tail,
+            # 五个列表使用相同下标，将原因、条件和原文关联到各自来源。
+            "reasons": [item["reason"] for item in evidence],
+            "conditions": [item["condition"] for item in evidence],
+            "source_doc_ids": [item["source_doc_id"] for item in evidence],
+            "evidence_quotes": [item["evidence_quote"] for item in evidence],
+            "source_files": [item["source_file"] for item in evidence],
+            "source_urls": list(dict.fromkeys(url for item in evidence for url in item["source_urls"])),
+        })
+    driver.execute_query(
+        "CREATE CONSTRAINT hero_name_unique IF NOT EXISTS "
+        "FOR (h:Hero) REQUIRE h.name IS UNIQUE", database_=DATABASE,
+    )
+    with driver.session(database=DATABASE) as session:
+        session.execute_write(write_graph, heroes, relationships)
+    return len(relationships)
 
 
 def write_graph(tx, heroes: list[str], relationships: list[dict]) -> None:
@@ -257,44 +283,29 @@ def write_graph(tx, heroes: list[str], relationships: list[dict]) -> None:
     ).consume()
 
 
+MATCHUP_PATTERNS = {
+    "incoming": "OPTIONAL MATCH (:Hero)-[r:COUNTERS]->(hero) ",
+    "outgoing": "OPTIONAL MATCH (hero)-[r:COUNTERS]->(:Hero) ",
+    "pair": "MATCH (target:Hero {name: $target}) OPTIONAL MATCH (hero)-[r:COUNTERS]-(target) ",
+}
+
+
 def retrieve(plan: dict, *, trace=None) -> list[dict]:
-    """校验 LLM 图查询计划，只执行固定参数化的一跳 Cypher。"""
-    if not isinstance(plan, dict) or plan.get("kind") not in {"incoming", "outgoing", "pair"}:
+    """按名称定位英雄，再查一跳关系。OPTIONAL MATCH 区分无关系和英雄未收录。"""
+    pattern = MATCHUP_PATTERNS.get(plan["kind"])
+    if pattern is None:
         raise ValueError("不支持的图查询计划")
     if trace:
-        trace.step("Neo4j 连接与认证")
-    with connect() as driver:
-        driver.verify_connectivity()
-        if trace:
-            trace.step("图谱英雄名单读取")
-        records, _, _ = driver.execute_query(
-            "MATCH (h:Hero) RETURN h.name AS name", database_=DATABASE
-        )
-        if trace:
-            trace.step("图查询计划校验与 Cypher 组装")
-        heroes = {record["name"] for record in records}
-        if plan.get("hero") not in heroes:
-            raise ValueError("图谱未收录该英雄，请明确问题中的英雄名")
-        plan = {"kind": plan["kind"], "hero": plan["hero"], "target": plan.get("target")}
-        if plan["kind"] == "pair" and (plan["target"] not in heroes or plan["target"] == plan["hero"]):
-            raise ValueError("双英雄图查询需要两个不同的已入库英雄")
-        conditions = {
-            "incoming": "b.name = $hero",
-            "outgoing": "a.name = $hero",
-            "pair": "((a.name = $hero AND b.name = $target) OR "
-                    "(a.name = $target AND b.name = $hero))",
-        }
-        cypher = (
-            "MATCH (a:Hero)-[r:COUNTERS]->(b:Hero) WHERE " + conditions[plan["kind"]]
-            + " RETURN a.name AS head, b.name AS tail, type(r) AS relation, "
-            "r.reasons AS reasons, r.conditions AS conditions, "
-            "r.evidence_quotes AS evidence_quotes, r.source_doc_ids AS source_doc_ids, "
-            "r.source_files AS source_files, r.source_urls AS source_urls "
-            "ORDER BY head, tail LIMIT 20"
-        )
-        if trace:
-            trace.step("图关系查询与结果整理")
-        records, _, _ = driver.execute_query(
-            cypher, parameters_=plan, database_=DATABASE
-        )
-    return [record.data() for record in records]
+        trace.step("Neo4j 英雄索引定位与关系查询")
+    records, _, _ = get_driver().execute_query(
+        "MATCH (hero:Hero {name: $hero}) " + pattern
+        + "RETURN startNode(r).name AS head, endNode(r).name AS tail, type(r) AS relation, "
+        "r.reasons AS reasons, r.conditions AS conditions, "
+        "r.evidence_quotes AS evidence_quotes, r.source_doc_ids AS source_doc_ids, "
+        "r.source_files AS source_files, r.source_urls AS source_urls "
+        "ORDER BY head, tail LIMIT 20",
+        parameters_=plan, database_=DATABASE, routing_="r",
+    )
+    if not records:
+        raise ValueError("图谱未收录查询的英雄")
+    return [record.data() for record in records if record["relation"] is not None]

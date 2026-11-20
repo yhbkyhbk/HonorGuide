@@ -22,6 +22,7 @@ API_KEY = _settings.get("API_KEY") or _settings.get("DASHSCOPE_API_KEY")
 BASE_URL = _settings.get("BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
 LLM_MODEL = _settings.get("LLM_MODEL", "qwen3.8-flash")
 EMBEDDING_MODEL = _settings.get("EMBEDDING_MODEL", "qwen3.7-text-embedding")
+MEMORY_EMBEDDING_MODEL = _settings.get("MEMORY_EMBEDDING_MODEL", "qwen3.7-text-embedding")
 
 NEO4J_URI = _settings.get("NEO4J_URI", "bolt://127.0.0.1:7687")
 NEO4J_USERNAME = _settings.get("NEO4J_USERNAME", "neo4j")

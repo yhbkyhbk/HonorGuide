@@ -16,10 +16,10 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from config import API_KEY, BASE_URL, QUESTIONS_FILE, RESULTS_FILE, LLM_MODEL, EMBEDDING_MODEL
-from .knowledge import current_revision, read_access
-from .pipeline import ask
+from agent.generate_cited_answer import CITATION
+from agent.run_qa_agent import AGENT_VERSION, ask, skill_digest
+from rag.knowledge.rebuild_knowledge_base import current_revision, read_access
 
-CITATION = re.compile(r"\[([TG]\d+)\]")
 METRIC_NAMES = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
 _run_lock = Lock()
 _results_lock = Lock()
@@ -120,7 +120,6 @@ def retrieval_metrics(case: dict, output: dict) -> dict:
             "evidence_recall": (text_hits + graph_hits) / total if total else None,
             "empty_graph_correct": not triples if case.get("expected_graph_empty") else None,
             "route_correct": output["used_mode"] == case["expected_mode"]}
-
 
 
 def citation_metrics(judgment: dict) -> dict:
@@ -257,12 +256,14 @@ async def score_dataset(data: dict, progress=None) -> dict:
                    "context_precision": ContextPrecision(llm=llm),
                    "context_recall": ContextRecall(llm=llm)}
         total = len(data["cases"])
+        by_id = {row["id"]: row for row in data["results"]}
         for position, case in enumerate(data["cases"], 1):
             if progress:
                 progress(position - 1, total, case["id"], "准备评测")
-            row = next((r for r in data["results"] if r["id"] == case["id"]), None)
+            row = by_id.get(case["id"])
             if row is None:
                 row = {"id": case["id"]}
+                by_id[case["id"]] = row
                 data["results"].append(row)
             try:
                 if "output" not in row:
@@ -272,15 +273,10 @@ async def score_dataset(data: dict, progress=None) -> dict:
                 current_signature = signature(case, row["output"])
                 if row.get("evaluation_signature") != current_signature:
                     # 保留已有回答；旧自定义分数单独归档，不与 RAGAS 平均值混合。
-                    previous = {k: v for k, v in row.items()
-                                if k not in ("id", "output", "answered_at_utc", "answer_origin",
-                                             "previous_evaluation")}
+                    answer_fields = {"id", "output", "answered_at_utc", "answer_origin", "previous_evaluation"}
+                    previous = {key: row.pop(key) for key in row.keys() - answer_fields}
                     if previous:
                         row["previous_evaluation"] = previous
-                    for key in list(row):
-                        if key not in ("id", "output", "answered_at_utc", "answer_origin",
-                                       "previous_evaluation"):
-                            del row[key]
                     row.update(evaluation_signature=current_signature, completed=False, ragas={})
                     row.setdefault("answer_origin", "saved_output")
                 if row.get("completed"):
@@ -365,30 +361,20 @@ def _run(restart, progress, top_k, recall_k) -> dict:
         raise ValueError("检索参数已变化，请点击“重新评测（覆盖结果）”，避免复用旧参数生成的回答")
     questions = [(case["id"], case["question"]) for case in data["cases"]]
     context = {
+        "workflow": AGENT_VERSION,
+        "skill_digest": skill_digest(),
         "knowledge_revision": current_revision(),
         "question_digest": hashlib.sha256(json.dumps(questions, ensure_ascii=False).encode()).hexdigest(),
         "generator": LLM_MODEL,
         "embedding": EMBEDDING_MODEL,
         "endpoint_digest": hashlib.sha256(BASE_URL.encode()).hexdigest(),
     }
-    saved_context = data.get("generation_context")
-    if data["results"] and not restart:
-        if saved_context is None:
-            # 原有结果没有版本，只允许在仍使用原有知识库和模型时继续。
-            models = data.get("models", {})
-            compatible = context["knowledge_revision"] is None and all(
-                key not in models or models[key] == context[key] for key in ("generator", "embedding")
-            )
-        else:
-            compatible = saved_context == context
-        if not compatible:
-            raise ValueError("测评的题目、知识库版本或模型配置已变化，请点击“重新评测（覆盖结果）”")
+    if data["results"] and not restart and data.get("generation_context") != context:
+        raise ValueError("测评链路、回答 Skill、题目或知识库配置已变化，请点击“重新评测（覆盖结果）”")
     data["generation_context"] = context
     data["run_settings"] = settings
     if restart:
         data["results"] = []
     data["engine"] = engine_info()
     data["models"] = {"generator": LLM_MODEL, "judge": LLM_MODEL, "embedding": EMBEDDING_MODEL}
-    if saved_context is None and data["results"]:
-        save(data)
     return asyncio.run(score_dataset(data, progress))

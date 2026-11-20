@@ -5,11 +5,9 @@
 
 # Generated documents, indexes, databases, and request logs
 /data/storage/
+/data/memory/
 /data/evaluation/results.json
 /data/evaluation/request_timings.jsonl
-
-# Machine-specific desktop shortcut
-/frontend/*.lnk
 
 # Python environments and caches
 .venv/

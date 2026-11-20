@@ -2,36 +2,12 @@
 
 from concurrent.futures import ThreadPoolExecutor, wait
 
-from .bm25.retriever import search as bm25_search
-from .vector.retriever import search as vector_search
+from .rank_with_rrf import rrf_fusion
+from .search_bm25_keywords import search as bm25_search
+from .search_milvus_vectors import search as vector_search
 
 
 _retrieval_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="honorguide-retrieval")
-
-
-def rrf_fusion(
-    rankings: dict[str, list[dict]], top_k: int = 3, rank_constant: int = 60
-) -> list[dict]:
-    """每路从第 1 名起计算 1/(60+rank)，按 chunk_id 合并并累加贡献。"""
-    if top_k <= 0 or rank_constant <= 0:
-        raise ValueError("top_k 和 rank_constant 必须大于 0")
-    fused = {}
-    for method, results in rankings.items():
-        seen = set()
-        for rank, result in enumerate(results, 1):
-            chunk_id = result["metadata"]["chunk_id"]
-            if chunk_id in seen:
-                continue
-            seen.add(chunk_id)
-            if chunk_id not in fused:
-                fused[chunk_id] = {**result, "score": 0.0, "ranks": {}, "raw_scores": {}}
-            item = fused[chunk_id]
-            item["score"] += 1 / (rank_constant + rank)
-            item["ranks"][method] = rank
-            item["raw_scores"][method] = result["score"]
-    return sorted(
-        fused.values(), key=lambda item: (-item["score"], item["metadata"]["chunk_id"])
-    )[:top_k]
 
 
 def _search_branch(search, question: str, recall_k: int, trace):

@@ -1,4 +1,4 @@
-"""文档处理模块：攻略读写、主题分块与 JSON 保存。"""
+"""读取 Markdown 攻略、按主题分块并保存供检索使用的 JSON。"""
 
 from __future__ import annotations
 
@@ -15,9 +15,8 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharac
 from config import ROOT as PROJECT_ROOT, DOCS_DIR as DEFAULT_DATA_DIR, STORAGE
 
 EXCLUDED_SECTIONS = {"资料说明", "参考来源"}
-
-
 MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\((https?://[^)\s]+)\)")
+CHUNKS_FILE = STORAGE / "chunks.json"
 
 
 def resolve_project_path(path: str | Path) -> Path:
@@ -103,24 +102,11 @@ def load_documents(data_dir: str | Path = DEFAULT_DATA_DIR) -> list[Document]:
     return documents
 
 
-def save_documents(path: Path, documents: list[Document]) -> None:
-    records = [
-        {
-            "id": doc.id,
-            "page_content": doc.page_content,
-            "metadata": doc.metadata,
-        }
-        for doc in documents
-    ]
-    path.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def load_parent_records() -> dict[str, dict]:
-    rows = json.loads((STORAGE / "documents.json").read_text(encoding="utf-8"))
-    return {row["metadata"]["doc_id"]: row for row in rows}
+def load_chunks() -> list[dict]:
+    rows = json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("文本块为空，请检查攻略后更新知识库")
+    return rows
 
 
 def split_documents(
@@ -155,7 +141,7 @@ def split_documents(
     )
 
     all_chunks = []
-    seen_ids: set[str] = set()
+    seen_ids = set()
     for parent in documents:
         doc_id = parent.metadata["doc_id"]
         if doc_id in seen_ids:
@@ -206,13 +192,13 @@ def split_documents(
     return all_chunks
 
 
-def prepare_documents(chunk_size: int = 400, chunk_overlap: int = 50) -> dict:
-    """供页面调用，处理当前攻略并保存完整父文档与子块。"""
+def prepare_documents(chunk_size: int = 400, chunk_overlap: int = 50) -> tuple[dict[str, dict], list[dict]]:
+    """读取一次 Markdown，保存子块，并将同批资料交给索引构建。"""
     parents = load_documents()
     chunks = split_documents(parents, chunk_size, chunk_overlap)
     if not chunks:
         raise ValueError("未生成任何有效分块，请检查文档内容")
     STORAGE.mkdir(parents=True, exist_ok=True)
-    save_documents(STORAGE / "documents.json", parents)
-    save_documents(STORAGE / "chunks.json", chunks)
-    return {"documents": len(parents), "chunks": len(chunks)}
+    rows = [doc.model_dump(include={"id", "page_content", "metadata"}) for doc in chunks]
+    CHUNKS_FILE.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {doc.id: doc.model_dump(include={"page_content", "metadata"}) for doc in parents}, rows

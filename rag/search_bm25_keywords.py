@@ -3,39 +3,26 @@
 from __future__ import annotations
 
 import json
-import logging
-import re
 from functools import lru_cache
 
-import jieba
 from rank_bm25 import BM25Okapi
 
 from config import STORAGE
+from .knowledge.prepare_documents import load_chunks
+from .tokenize_search_text import register_terms, tokenize
 
-CHUNKS_FILE = STORAGE / "chunks.json"
 INDEX_FILE = STORAGE / "bm25.json"
-STOP_WORDS = {"的", "了", "是", "和", "与", "在", "有", "能", "吗", "什么", "哪些", "怎么", "如何", "可以", "请问"}
-jieba.setLogLevel(logging.WARNING)
 
 
-def tokenize(text: str) -> list[str]:
-    """文档与问题使用同样的规则：去来源行和 URL，分词后过滤标点与停用词。"""
-    text = re.sub(r"(?m)^(?:参考|机制参考|铭文参考)[：:].*$", "", text)
-    text = re.sub(r"https?://[^\s)]+", "", text)
-    return [
-        word for word in jieba.lcut(text.lower())
-        if re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]+", word) and word not in STOP_WORDS
-    ]
-
-
-def build_index() -> BM25Okapi:
-    """保存词频、IDF、长度，以及“词 → 块编号列表”的倒排索引。"""
-    chunks = json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
-    if not isinstance(chunks, list) or not chunks:
-        raise ValueError("文本块为空，请检查攻略后更新知识库")
+def _register_heroes(chunks: list[dict]) -> None:
     # 从现有元数据加入英雄名，避免“艾琳”等名称被拆开，不需要单独的词典文件。
-    for hero in {chunk["metadata"]["hero"] for chunk in chunks}:
-        jieba.add_word(hero)
+    register_terms({chunk["metadata"]["hero"] for chunk in chunks})
+
+
+def build_index(chunks: list[dict] | None = None) -> BM25Okapi:
+    """保存词频、IDF、长度，以及“词 → 块编号列表”的倒排索引。"""
+    chunks = load_chunks() if chunks is None else chunks
+    _register_heroes(chunks)
 
     corpus = [tokenize(chunk["page_content"]) for chunk in chunks]
     if not any(corpus):
@@ -56,17 +43,16 @@ def build_index() -> BM25Okapi:
 @lru_cache(maxsize=1)
 def load_index() -> tuple[BM25Okapi, list[dict]]:
     """恢复 BM25 统计和分块，初始化结巴词典并注册英雄名。"""
-    chunks = json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
+    chunks = load_chunks()
     state = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
     if "postings" not in state:
         raise ValueError("旧 BM25 索引不含倒排表，请在侧栏更新知识库")
     # 绕过 __init__ 恢复已有统计，避免再次分词和计算 IDF。
     index = BM25Okapi.__new__(BM25Okapi)
     index.__dict__.update(state)
-    if not chunks or index.corpus_size != len(chunks):
+    if index.corpus_size != len(chunks):
         raise ValueError("BM25 索引与分块数量不匹配，请在侧栏更新知识库")
-    for hero in {chunk["metadata"]["hero"] for chunk in chunks}:
-        jieba.add_word(hero)
+    _register_heroes(chunks)
     return index, chunks
 
 
